@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <time.h>
 
 // =====================================================================
 // PREENCHA AQUI (os 4 valores abaixo)
@@ -47,6 +48,10 @@ const int VALOR_UMIDO = 0;
 #define PIN_ATUADOR_3 27     // Umidificador  (umid. ar < mínimo)
 #define PIN_ATUADOR_4 33     // Irrigação     (umid. solo < mínimo)
 #define PIN_ATUADOR_5 18     // Ventilação    (temp > máximo)
+#define PIN_ATUADOR_6 32     // Grow light    (horas de luz por dia, pelo relógio da internet)
+
+// Fuso horário (Brasília = UTC-3, sem horário de verão)
+const long FUSO_SEGUNDOS = -3 * 3600;
 
 // --- HISTERESE: evita o relé ficar ligando e desligando sem parar ---
 const float HIST_TEMP = 1.0;   // °C
@@ -54,17 +59,23 @@ const float HIST_AR   = 3.0;   // %
 const float HIST_SOLO = 5.0;   // %
 
 // --- LIMITES (começam iguais ao seu código antigo; o site pode mudar) ---
-struct Limites { float tMin, tMax, arMin, arMax, soloMin, soloMax, phMin, phMax; };
-Limites limites = {25, 30, 80, 95, 50, 80, 5.5, 7.5};
+// luzHoras = horas de grow light por dia (0 a 24); luzInicio = hora em que acende (0 a 23)
+struct Limites { float tMin, tMax, arMin, arMax, soloMin, soloMax, phMin, phMax, luzHoras; int luzInicio; };
+Limites limites = {25, 30, 80, 95, 50, 80, 5.5, 7.5, 12, 6};
 uint64_t versaoAplicada = 0;
 
 // --- DADOS COMPARTILHADOS ENTRE O CONTROLE E A TAREFA DE REDE ---
 struct Dados {
   float temp, ar, solo, ph;
-  bool aquecimento, ventilacao, umidificador, irrigacao;
+  bool aquecimento, ventilacao, umidificador, irrigacao, growlight;
   bool valido;
 };
-Dados dados = {0, 0, 0, 0, false, false, false, false, false};
+Dados dados = {0, 0, 0, 0, false, false, false, false, false, false};
+
+// Aviso no LCD quando chegam dados novos do site (a tarefa de rede liga, o loop mostra)
+volatile bool avisoConfig = false;
+unsigned long avisoAte = 0;
+bool avisoAtivo = false;
 
 SemaphoreHandle_t mutex;
 Preferences prefs;
@@ -78,7 +89,7 @@ unsigned long tempoAnteriorTela = 0;
 int telaAtual = 0;
 
 // Estado dos atuadores (guardado entre uma volta e outra por causa da histerese)
-bool stAquec = false, stVent = false, stUmid = false, stIrrig = false;
+bool stAquec = false, stVent = false, stUmid = false, stIrrig = false, stLuz = false;
 
 // =====================================================================
 // MEMÓRIA: guarda os limites para continuar valendo se faltar energia/internet
@@ -93,6 +104,8 @@ void carregarLimites() {
   limites.soloMax = prefs.getFloat("soloMax", limites.soloMax);
   limites.phMin   = prefs.getFloat("phMin", limites.phMin);
   limites.phMax   = prefs.getFloat("phMax", limites.phMax);
+  limites.luzHoras  = prefs.getFloat("luzH", limites.luzHoras);
+  limites.luzInicio = prefs.getInt("luzI", limites.luzInicio);
   versaoAplicada  = prefs.getULong64("versao", 0);
   prefs.end();
 }
@@ -107,6 +120,8 @@ void salvarLimites() {
   prefs.putFloat("soloMax", limites.soloMax);
   prefs.putFloat("phMin", limites.phMin);
   prefs.putFloat("phMax", limites.phMax);
+  prefs.putFloat("luzH", limites.luzHoras);
+  prefs.putInt("luzI", limites.luzInicio);
   prefs.putULong64("versao", versaoAplicada);
   prefs.end();
 }
@@ -131,6 +146,7 @@ void enviarLeitura() {
   at["ventilacao"] = d.ventilacao;
   at["umidificador"] = d.umidificador;
   at["irrigacao"] = d.irrigacao;
+  at["growlight"] = d.growlight;
   String corpo;
   serializeJson(doc, corpo);
 
@@ -190,17 +206,28 @@ void buscarConfig() {
   if (!lerPar(l["solo"], n.soloMin, n.soloMax, 10, 100)) return;
   if (!lerPar(l["ph"], n.phMin, n.phMax, 4, 9)) return;
 
+  // Grow light (se o site ainda não mandou, mantém o que já estava)
+  if (!doc["luz"].isNull()) {
+    float horas = doc["luz"]["horas"] | -1.0f;
+    int inicio = doc["luz"]["inicio"] | -1;
+    if (horas < 0 || horas > 24 || inicio < 0 || inicio > 23) return;
+    n.luzHoras = horas;
+    n.luzInicio = inicio;
+  }
+
   xSemaphoreTake(mutex, portMAX_DELAY);
   limites = n;
   xSemaphoreGive(mutex);
   versaoAplicada = versao;
   salvarLimites();
-  Serial.println("Novos limites recebidos do site e salvos.");
+  avisoConfig = true;  // o loop mostra "Dados recebidos!" no LCD
+  Serial.println("Novos limites e grow light recebidos do site e salvos.");
 }
 
 void tarefaRede(void *param) {
   unsigned long ultimoEnvio = 0, ultimaConfig = 0, ultimaTentativaWifi = 0;
   bool primeiro = true;
+  bool ntpIniciado = false;
   for (;;) {
     unsigned long agora = millis();
     if (WiFi.status() != WL_CONNECTED) {
@@ -215,6 +242,10 @@ void tarefaRede(void *param) {
       continue;
     }
     wifiOk = true;
+    if (!ntpIniciado) {  // pega a hora na internet (necessária para a grow light)
+      configTime(FUSO_SEGUNDOS, 0, "pool.ntp.org", "time.google.com");
+      ntpIniciado = true;
+    }
     if (primeiro || agora - ultimaConfig >= INTERVALO_CONFIG_MS) {
       ultimaConfig = agora;
       buscarConfig();
@@ -251,7 +282,9 @@ void setup() {
   pinMode(PIN_ATUADOR_3, OUTPUT);
   pinMode(PIN_ATUADOR_4, OUTPUT);
   pinMode(PIN_ATUADOR_5, OUTPUT);
+  pinMode(PIN_ATUADOR_6, OUTPUT);
 
+  digitalWrite(PIN_ATUADOR_6, RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_1, RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_2, RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_3, RELE_DESLIGADO);
@@ -346,6 +379,21 @@ void loop() {
   if (umidadeSoloPercent < L.soloMin) stIrrig = true;
   else if (umidadeSoloPercent >= fmin(L.soloMin + HIST_SOLO, L.soloMax)) stIrrig = false;
 
+  // Grow light: liga durante "luzHoras" horas a partir de "luzInicio" (pode passar da meia-noite).
+  // Sem hora da internet (NTP) o relé fica desligado, que é o estado seguro.
+  bool horaOk = time(nullptr) > 1700000000;
+  if (horaOk) {
+    struct tm agoraTm;
+    time_t t = time(nullptr);
+    localtime_r(&t, &agoraTm);
+    int minAgora = agoraTm.tm_hour * 60 + agoraTm.tm_min;
+    int desde = (minAgora - L.luzInicio * 60 + 1440) % 1440;  // minutos desde que a luz deveria ter acendido
+    stLuz = desde < (int)(L.luzHoras * 60);
+  } else {
+    stLuz = false;
+  }
+
+  digitalWrite(PIN_ATUADOR_6, stLuz ? RELE_LIGADO : RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_2, stAquec ? RELE_LIGADO : RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_3, stUmid ? RELE_LIGADO : RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_4, stIrrig ? RELE_LIGADO : RELE_DESLIGADO);
@@ -361,19 +409,40 @@ void loop() {
   dados.ventilacao = stVent;
   dados.umidificador = stUmid;
   dados.irrigacao = stIrrig;
+  dados.growlight = stLuz;
   dados.valido = tempOk && arOk;
   xSemaphoreGive(mutex);
 
   // ==========================================
   // 4. ATUALIZAÇÃO DO DISPLAY LCD (A CADA 2,5s)
   // ==========================================
-  if (tempoAtual - tempoAnteriorTela >= 2500) {
+  // Aviso de 4 s quando chegam limites/grow light novos do site
+  if (avisoConfig) {
+    avisoConfig = false;
+    avisoAte = tempoAtual + 4000;
+    avisoAtivo = true;
+    char linha[20];
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Dados recebidos!");
+    snprintf(linha, sizeof(linha), "Luz%gh das %02dh", L.luzHoras, L.luzInicio);
+    lcd.setCursor(0, 1);
+    lcd.print(linha);
+  }
+  bool mostrandoAviso = avisoAtivo && (long)(avisoAte - tempoAtual) > 0;
+  if (avisoAtivo && !mostrandoAviso) {  // acabou o aviso: volta para as telas normais
+    avisoAtivo = false;
     tempoAnteriorTela = tempoAtual;
-    telaAtual = (telaAtual + 1) % 4;
     lcd.clear();
   }
 
-  switch (telaAtual) {
+  if (!mostrandoAviso && tempoAtual - tempoAnteriorTela >= 2500) {
+    tempoAnteriorTela = tempoAtual;
+    telaAtual = (telaAtual + 1) % 5;
+    lcd.clear();
+  }
+
+  if (!mostrandoAviso) switch (telaAtual) {
     case 0: // TELA 1: Sensores de Ar
       lcd.setCursor(0, 0);
       lcd.print("Temp: ");
@@ -417,7 +486,22 @@ void loop() {
       lcd.print(" R5 "); lcd.print(stVent ? "ON " : "OFF");
       break;
 
-    case 3: // TELA 4: Conexão
+    case 3: { // TELA 4: Grow light
+      char linha[20];
+      lcd.setCursor(0, 0);
+      lcd.print(stLuz ? "Grow light: ON  " : "Grow light: OFF ");
+      lcd.setCursor(0, 1);
+      if (!horaOk) {
+        lcd.print("Sem hora (NTP)  ");
+      } else {
+        snprintf(linha, sizeof(linha), "%gh das %02dh", L.luzHoras, L.luzInicio);
+        lcd.print(linha);
+        for (size_t i = strlen(linha); i < 16; i++) lcd.print(' ');
+      }
+      break;
+    }
+
+    case 4: // TELA 5: Conexão
       lcd.setCursor(0, 0);
       lcd.print(wifiOk ? "WiFi: conectado " : "WiFi: sem sinal ");
       lcd.setCursor(0, 1);
@@ -439,6 +523,7 @@ void loop() {
   Serial.print(" R3 "); Serial.print(stUmid ? "ON" : "OFF");
   Serial.print(" R4 "); Serial.print(stIrrig ? "ON" : "OFF");
   Serial.print(" R5 "); Serial.print(stVent ? "ON" : "OFF");
+  Serial.print(" R6(luz) "); Serial.print(stLuz ? "ON" : "OFF");
   Serial.print(" | WiFi "); Serial.print(wifiOk ? "OK" : "--");
   Serial.print(" Site "); Serial.println(siteOk ? "OK" : "--");
 
