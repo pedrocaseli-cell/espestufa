@@ -1,3 +1,5 @@
+#include <Arduino.h>
+
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include "DHT.h"
@@ -43,12 +45,11 @@ const int VALOR_SECO = 1800;
 const int VALOR_UMIDO = 0;
 
 // --- PINOS DOS ATUADORES (RELÉS) ---
-#define PIN_ATUADOR_1 25     // Loop: 10s ON / 5s OFF
+#define PIN_ATUADOR_1 25     // Grow light   (horas de luz por dia, pelo relógio da internet)
 #define PIN_ATUADOR_2 26     // Aquecimento   (temp < mínimo)
 #define PIN_ATUADOR_3 27     // Umidificador  (umid. ar < mínimo)
 #define PIN_ATUADOR_4 33     // Irrigação     (umid. solo < mínimo)
 #define PIN_ATUADOR_5 18     // Ventilação    (temp > máximo)
-#define PIN_ATUADOR_6 32     // Grow light    (horas de luz por dia, pelo relógio da internet)
 
 // Fuso horário (Brasília = UTC-3, sem horário de verão)
 const long FUSO_SEGUNDOS = -3 * 3600;
@@ -83,8 +84,6 @@ volatile bool wifiOk = false;
 volatile bool siteOk = false;
 
 // --- VARIÁVEIS DE TEMPORIZAÇÃO ---
-unsigned long tempoAnteriorAtuador1 = 0;
-bool estadoAtuador1 = false;
 unsigned long tempoAnteriorTela = 0;
 int telaAtual = 0;
 
@@ -282,9 +281,7 @@ void setup() {
   pinMode(PIN_ATUADOR_3, OUTPUT);
   pinMode(PIN_ATUADOR_4, OUTPUT);
   pinMode(PIN_ATUADOR_5, OUTPUT);
-  pinMode(PIN_ATUADOR_6, OUTPUT);
 
-  digitalWrite(PIN_ATUADOR_6, RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_1, RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_2, RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_3, RELE_DESLIGADO);
@@ -302,23 +299,6 @@ void setup() {
 
 void loop() {
   unsigned long tempoAtual = millis();
-
-  // ==========================================
-  // 1. CONTROLE TEMPORIZADO DO ATUADOR 1
-  // ==========================================
-  if (estadoAtuador1 == true) {
-    if (tempoAtual - tempoAnteriorAtuador1 >= 10000) {
-      estadoAtuador1 = false;
-      digitalWrite(PIN_ATUADOR_1, RELE_DESLIGADO);
-      tempoAnteriorAtuador1 = tempoAtual;
-    }
-  } else {
-    if (tempoAtual - tempoAnteriorAtuador1 >= 5000) {
-      estadoAtuador1 = true;
-      digitalWrite(PIN_ATUADOR_1, RELE_LIGADO);
-      tempoAnteriorAtuador1 = tempoAtual;
-    }
-  }
 
   // ==========================================
   // 2. LEITURA DOS SENSORES
@@ -393,7 +373,7 @@ void loop() {
     stLuz = false;
   }
 
-  digitalWrite(PIN_ATUADOR_6, stLuz ? RELE_LIGADO : RELE_DESLIGADO);
+  digitalWrite(PIN_ATUADOR_1, stLuz ? RELE_LIGADO : RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_2, stAquec ? RELE_LIGADO : RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_3, stUmid ? RELE_LIGADO : RELE_DESLIGADO);
   digitalWrite(PIN_ATUADOR_4, stIrrig ? RELE_LIGADO : RELE_DESLIGADO);
@@ -477,19 +457,21 @@ void loop() {
 
     case 2: // TELA 3: Status dos Atuadores
       lcd.setCursor(0, 0);
-      lcd.print("R1 "); lcd.print(estadoAtuador1 ? "ON " : "OFF");
-      lcd.print(" R2 "); lcd.print(stAquec ? "ON " : "OFF");
-      lcd.print(" R3 "); lcd.print(stUmid ? "ON" : "OFF");
+      lcd.print("R1:"); lcd.print(stLuz ? 1 : 0);
+      lcd.print(" R2:"); lcd.print(stAquec ? 1 : 0);
+      lcd.print(" R3:"); lcd.print(stUmid ? 1 : 0);
+      lcd.print("   ");
 
       lcd.setCursor(0, 1);
-      lcd.print("R4 "); lcd.print(stIrrig ? "ON " : "OFF");
-      lcd.print(" R5 "); lcd.print(stVent ? "ON " : "OFF");
+      lcd.print("R4:"); lcd.print(stIrrig ? 1 : 0);
+      lcd.print(" R5:"); lcd.print(stVent ? 1 : 0);
+      lcd.print("        ");
       break;
 
     case 3: { // TELA 4: Grow light
       char linha[20];
       lcd.setCursor(0, 0);
-      lcd.print(stLuz ? "Grow light: ON  " : "Grow light: OFF ");
+      lcd.print("Horario da luz  ");
       lcd.setCursor(0, 1);
       if (!horaOk) {
         lcd.print("Sem hora (NTP)  ");
@@ -518,12 +500,11 @@ void loop() {
   Serial.print(" | pH ADC: "); Serial.print((int)mediaADC_pH);
   Serial.print(" | Solo: "); Serial.print(umidadeSoloPercent);
   Serial.print("% | Solo ADC: "); Serial.print(leituraSoloRaw);
-  Serial.print(" | R1 "); Serial.print(estadoAtuador1 ? "ON" : "OFF");
+  Serial.print(" | R1(luz) "); Serial.print(stLuz ? "ON" : "OFF");
   Serial.print(" R2 "); Serial.print(stAquec ? "ON" : "OFF");
   Serial.print(" R3 "); Serial.print(stUmid ? "ON" : "OFF");
   Serial.print(" R4 "); Serial.print(stIrrig ? "ON" : "OFF");
   Serial.print(" R5 "); Serial.print(stVent ? "ON" : "OFF");
-  Serial.print(" R6(luz) "); Serial.print(stLuz ? "ON" : "OFF");
   Serial.print(" | WiFi "); Serial.print(wifiOk ? "OK" : "--");
   Serial.print(" Site "); Serial.println(siteOk ? "OK" : "--");
 
